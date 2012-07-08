@@ -45,7 +45,7 @@ module Tire
       def custom_score(options={}, &block)
         @custom_score ||= Query.new(&block)
         @value[:custom_score] = {}
-        @value[:custom_score].update({:query => @custom_score.to_hash}.merge(options))
+        @value[:custom_score].update({:query => @custom_score.to_hash.merge(options)})
         @value
       end
 
