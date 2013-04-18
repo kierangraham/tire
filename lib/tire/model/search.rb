@@ -52,7 +52,7 @@ module Tire
         #     end
         #
         # This methods returns a Tire::Results::Collection instance, containing instances
-        # of Tire::Results::Item, populated by the data available in _ElasticSearch, by default.
+        # of Tire::Results::Item, populated by the data available in _Elasticsearch, by default.
         #
         # If you'd like to load the "real" models from the database, you may use the `:load` option:
         #
@@ -72,18 +72,26 @@ module Tire
             options ||= {}
           end
 
-          sort      = Array( options[:order] || options[:sort] )
           options   = default_options.update(options)
+          sort      = Array( options.delete(:order) || options.delete(:sort) )
 
           s = Tire::Search::Search.new(options.delete(:index), options)
-          s.size( options[:per_page].to_i ) if options[:per_page]
-          s.from( options[:page].to_i <= 1 ? 0 : (options[:per_page].to_i * (options[:page].to_i-1)) ) if options[:page] && options[:per_page]
+
+          page     = options.delete(:page)
+          per_page = options.delete(:per_page) || Tire::Results::Pagination::default_per_page
+
+          s.size( per_page.to_i ) if per_page
+          s.from( page.to_i <= 1 ? 0 : (per_page.to_i * (page.to_i-1)) ) if page && per_page
+
           s.sort do
             sort.each do |t|
-              field_name, direction = t.split(' ')
+              field_name, direction = t.split(':')
               by field_name, direction
             end
           end unless sort.empty?
+
+          version = options.delete(:version)
+          s.version(version) if version
 
           if block_given?
             block.arity < 1 ? s.instance_eval(&block) : block.call(s)
@@ -95,6 +103,12 @@ module Tire
           end
 
           s.results
+        end
+
+        def multi_search(options={}, &block)
+          default_options = {:type => document_type}
+          options         = default_options.update(options)
+          Tire::Search::Multi::Search.new(index.name, options, &block).results
         end
 
         # Returns a Tire::Index instance for this model.
@@ -118,7 +132,7 @@ module Tire
           instance.class.tire.index
         end
 
-        # Updates the index in _ElasticSearch_.
+        # Updates the index in _Elasticsearch_.
         #
         # On model instance create or update, it will store its serialized representation in the index.
         #
@@ -127,16 +141,12 @@ module Tire
         # It will also execute any `<after|before>_update_elasticsearch_index` callback hooks.
         #
         def update_index
-          instance.send :_run_update_elasticsearch_index_callbacks do
+          instance.run_callbacks :update_elasticsearch_index do
             if instance.destroyed?
               index.remove instance
             else
-              response  = index.store( instance, {:percolate => percolator} )
-              instance.id     ||= response['_id']      if instance.respond_to?(:id=)
-              instance._index   = response['_index']   if instance.respond_to?(:_index=)
-              instance._type    = response['_type']    if instance.respond_to?(:_type=)
-              instance._version = response['_version'] if instance.respond_to?(:_version=)
-              instance.matches  = response['matches']  if instance.respond_to?(:matches=)
+              response = index.store( instance, {:percolate => percolator} )
+              instance.tire.matches = response['matches'] if instance.tire.respond_to?(:matches=)
               self
             end
           end
@@ -148,11 +158,11 @@ module Tire
         #
         # If you don't define any mapping, the model is serialized as-is.
         #
-        # If you do define the mapping for _ElasticSearch_, only attributes
+        # If you do define the mapping for _Elasticsearch_, only attributes
         # declared in the mapping are serialized.
         #
         # For properties declared with the `:as` option, the passed String or Proc
-        # is evaluated in the instance context.
+        # is evaluated in the instance context. Other objects are indexed "as is".
         #
         def to_indexed_json
           if instance.class.tire.mapping.empty?
@@ -170,7 +180,9 @@ module Tire
                   hash[key] = instance.instance_eval(options[:as])
                 when Proc
                   hash[key] = instance.instance_eval(&options[:as])
-              end
+                else
+                  hash[key] = options[:as]
+              end if options[:as]
             end
 
             hash.to_json
@@ -178,11 +190,17 @@ module Tire
         end
 
         def matches
-          @attributes['matches']
+          instance.instance_eval do
+            @tire__attributes ||= {}
+            @tire__attributes['matches']
+          end
         end
 
         def matches=(value)
-          @attributes ||= {}; @attributes['matches'] = value
+          instance.instance_eval do
+            @tire__attributes ||= {}
+            @tire__attributes['matches'] = value
+          end
         end
 
       end
@@ -298,7 +316,6 @@ module Tire
         Results::Item.send :include, Loader
       end
 
-      
     end
 
   end

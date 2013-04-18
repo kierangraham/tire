@@ -59,9 +59,62 @@ module Tire
         assert_equal 1,      s.results.facets['tags']['terms'].first['count'].to_i
       end
 
+      should "allow to define the facet filter with DSL" do
+          s = Tire.search('articles-test', :search_type => 'count') do
+            facet 'tags' do
+              terms :tags
+              facet_filter :range, { :published_on => { :from => '2011-01-01', :to => '2011-01-01' } }
+            end
+          end
+
+          assert_equal 1,      s.results.facets.size
+          assert_equal 'ruby', s.results.facets['tags']['terms'].first['term']
+          assert_equal 1,      s.results.facets['tags']['terms'].first['count'].to_i
+      end
+
+      should "allow arbitrary order of methods in the DSL block" do
+          s = Tire.search('articles-test', :search_type => 'count') do
+            facet 'tags' do
+              facet_filter :range, { :published_on => { :from => '2011-01-01', :to => '2011-01-01' } }
+              terms :tags
+            end
+          end
+
+          assert_equal 1,      s.results.facets.size
+          assert_equal 'ruby', s.results.facets['tags']['terms'].first['term']
+          assert_equal 1,      s.results.facets['tags']['terms'].first['count'].to_i
+      end
+
+      context "terms" do
+        setup do
+          @s = Tire.search('articles-test') do
+            query { string 'tags:ruby' }
+          end
+        end
+
+        should "return results ordered by term" do
+          @s.facet('tags')              { terms :tags                }
+          @s.facet('term-ordered-tags') { terms :tags, order: 'term' }
+
+          facets = @s.results.facets
+          # p facets
+          assert_equal 'ruby',   facets['tags']['terms']             .first['term']
+          assert_equal 'python', facets['term-ordered-tags']['terms'].first['term']
+        end
+
+        should "return results aggregated over multiple fields" do
+          @s.facet('multiple-fields') { terms ['tags', 'words'] }
+
+          facets = @s.results.facets
+          # p facets
+          assert_equal 4, facets['multiple-fields']['terms'].size
+        end
+
+      end
+
       context "date histogram" do
 
-        should "return aggregated values for all results" do
+        should "return aggregated counts for each bucket" do
           s = Tire.search('articles-test') do
             query { all }
             facet 'published_on' do
@@ -71,7 +124,35 @@ module Tire
 
           facets = s.results.facets['published_on']['entries']
           assert_equal 4, facets.size, facets.inspect
-          assert_equal 2, facets.entries[1]["count"], facets.inspect
+          assert_equal 2, facets.entries[1]['count'], facets.inspect
+        end
+
+        should "return value statistics for each bucket" do
+          s = Tire.search('articles-test', search_type: 'count') do
+            query { all }
+            facet 'published_on' do
+              date :published_on, value_field: 'words'
+            end
+          end
+
+          facets = s.results.facets['published_on']['entries']
+          assert_equal 4, facets.size, facets.inspect
+          assert_equal 2, facets.entries[1]['count'], facets.inspect
+          assert_equal 625.0, facets.entries[1]['total'], facets.inspect
+        end
+
+        should "return value statistics for each bucket by script" do
+          s = Tire.search('articles-test', search_type: 'count') do
+            query { all }
+            facet 'published_on' do
+              date :published_on, value_script: "doc.title.value.length()"
+            end
+          end
+
+          facets = s.results.facets['published_on']['entries']
+          assert_equal 4, facets.size, facets.inspect
+          assert_equal 2, facets.entries[1]['count'], facets.inspect
+          assert_equal 8.0, facets.entries[1]['total'], facets.inspect # Two + Three => 8 characters
         end
 
       end
@@ -211,22 +292,20 @@ module Tire
       end
 
       context "filter" do
-        should "return a filtered facet" do
-          s = Tire.search('articles-test') do
-            query { all }
+
+        should "return a filter facet" do
+          s = Tire.search('articles-test', :search_type => 'count') do
             facet 'filtered' do
-              filter :tags, 'ruby'
+              filter :range, :words => { :from => 100, :to => 200 }
             end
           end
 
-          assert_equal 5, s.results.size, s.results.inspect
           facets = s.results.facets["filtered"]
           assert_equal 2, facets["count"], facets.inspect
         end
+
       end
 
     end
-
   end
-
 end

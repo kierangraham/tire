@@ -20,11 +20,14 @@ module Tire
         end
       end
 
-      # Delegate method to a key in underlying hash, if present,
-      # otherwise return +nil+.
+      # Delegate method to a key in underlying hash, if present, otherwise return +nil+.
       #
       def method_missing(method_name, *arguments)
-        @attributes.has_key?(method_name.to_sym) ? @attributes[method_name.to_sym] : nil
+        @attributes[method_name.to_sym]
+      end
+
+      def respond_to?(method_name, include_private = false)
+        @attributes.has_key?(method_name.to_sym) || super
       end
 
       def [](key)
@@ -56,8 +59,21 @@ module Tire
       end
 
       def to_hash
-        @attributes
+        @attributes.reduce({}) do |sum, item|
+          sum[ item.first ] = item.last.respond_to?(:to_hash) ? item.last.to_hash : item.last
+          sum
+        end
       end
+
+      def as_json(options=nil)
+        hash = to_hash
+        hash.respond_to?(:with_indifferent_access) ? hash.with_indifferent_access.as_json(options) : hash.as_json(options)
+      end
+
+      def to_json(options=nil)
+        as_json.to_json(options)
+      end
+      alias_method :to_indexed_json, :to_json
 
       # Let's pretend we're someone else in Rails
       #
@@ -71,11 +87,6 @@ module Tire
         s = []; @attributes.each { |k,v| s << "#{k}: #{v.inspect}" }
         %Q|<Item#{self.class.to_s == 'Tire::Results::Item' ? '' : " (#{self.class})"} #{s.join(', ')}>|
       end
-
-      def to_json(options=nil)
-        @attributes.to_json(options)
-      end
-      alias_method :to_indexed_json, :to_json
 
     end
 

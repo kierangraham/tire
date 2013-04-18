@@ -19,6 +19,10 @@ module Tire::Search
           term(:foo, 'bar')
         end.to_json)
       end
+
+      should "have accessor for value" do
+        assert_equal( {}, Query.new.value )
+      end
     end
 
     context "Term query" do
@@ -28,6 +32,17 @@ module Tire::Search
 
       should "allow search for single term passing an options hash" do
         assert_equal( { :term => { :foo => { :term => 'bar', :boost => 2.0 } } }, Query.new.term(:foo, 'bar', :boost => 2.0) )
+      end
+
+      should "allow complex term queries" do
+        assert_equal( { :term => { :foo => { :field => 'bar', :boost => 2.0 } } }, Query.new.term(:foo, {:field => 'bar', :boost => 2.0}) )
+      end
+
+      should "allow complex term queries with Hash-like objects" do
+        assert_equal(
+          { :term => { :foo => { :field => 'bar', :boost => 2.0 } } },
+          Query.new.term(:foo, Hashr.new( :field => 'bar', :boost => 2.0 ))
+        )
       end
     end
 
@@ -39,6 +54,11 @@ module Tire::Search
       should "allow set minimum match when searching for multiple terms" do
         assert_equal( { :terms => { :foo => ['bar', 'baz'], :minimum_match => 2 } },
                       Query.new.terms(:foo, ['bar', 'baz'], :minimum_match => 2) )
+      end
+
+      should "allow set boost when searching for multiple terms" do
+        assert_equal( { :terms => { :foo => ['bar', 'baz'], :boost => 2 } },
+                      Query.new.terms(:foo, ['bar', 'baz'], :boost => 2) )
       end
     end
 
@@ -105,6 +125,10 @@ module Tire::Search
       should "search for all documents" do
         assert_equal( { :match_all => { } }, Query.new.all )
       end
+
+      should "allow passing arguments" do
+        assert_equal( { :match_all => {:boost => 1.2} }, Query.new.all(:boost => 1.2) )
+      end
     end
 
     context "IDs query" do
@@ -113,7 +137,7 @@ module Tire::Search
                       Query.new.ids([1, 2], 'foo') )
       end
     end
-    
+
     context "FuzzyQuery" do
 
       should "allow a fuzzy search" do
@@ -248,6 +272,175 @@ module Tire::Search
       end
 
     end
-  end
 
+    context "DisMaxQuery" do
+
+      should "not raise an error when no block is given" do
+        assert_nothing_raised { Query.new.dis_max }
+      end
+
+      should "encode options" do
+        query = Query.new.dis_max(:tie_breaker => 0.7) do
+          query { string 'foo' }
+        end
+
+        assert_equal 0.7, query[:dis_max][:tie_breaker]
+      end
+
+      should "wrap single query" do
+        assert_equal( { :dis_max => {:queries => [{ :query_string => { :query => 'foo' } }] }},
+                      Query.new.dis_max { query { string 'foo' } } )
+      end
+
+      should "wrap multiple queries" do
+        query = Query.new.dis_max do
+          query   { string 'foo' }
+          query   { string 'bar' }
+          query   { string 'baz' }
+        end
+
+        assert_equal 3, query[:dis_max][:queries].size
+
+        assert_equal( { :query_string => {:query => 'foo'} }, query[:dis_max][:queries][0] )
+        assert_equal( { :query_string => {:query => 'bar'} }, query[:dis_max][:queries][1] )
+        assert_equal( { :query_string => {:query => 'baz'} }, query[:dis_max][:queries][2] )
+      end
+
+      should "allow passing variables from outer scope" do
+        @q1 = 'foo'
+        @q2 = 'bar'
+        query = Query.new.dis_max do |dis_max|
+          dis_max.query { |query| query.string @q1 }
+          dis_max.query { |query| query.string @q2 }
+        end
+
+        assert_equal( 2, query[:dis_max][:queries].size, query[:dis_max][:queries].inspect )
+        assert_equal( { :query_string => {:query => 'foo'} }, query[:dis_max][:queries].first )
+        assert_equal( { :query_string => {:query => 'bar'} }, query[:dis_max][:queries].last )
+      end
+
+    end
+
+    context "BoostingQuery" do
+
+      should "not raise an error when no block is given" do
+        assert_nothing_raised { Query.new.boosting }
+      end
+
+      should "encode options" do
+        query = Query.new.boosting(:negative_boost => 0.2) do
+          positive { string 'foo' }
+        end
+
+        assert_equal 0.2, query[:boosting][:negative_boost]
+      end
+
+      should "wrap positive query" do
+        assert_equal( { :boosting => {:positive => [{ :query_string => { :query => 'foo' } }] }},
+                      Query.new.boosting { positive { string 'foo' } } )
+      end
+
+      should "wrap negative query" do
+        assert_equal( { :boosting => {:negative => [{ :query_string => { :query => 'foo' } }] }},
+                      Query.new.boosting { negative { string 'foo' } } )
+      end
+
+      should "wrap multiple queries for the same condition" do
+        query = Query.new.boosting do
+          positive { string 'foo' }
+          positive { term('bar', 'baz') }
+        end
+
+        assert_equal( 2, query[:boosting][:positive].size, query[:boosting][:positive].inspect )
+        assert_equal( { :query_string => {:query => 'foo'} }, query[:boosting][:positive].first )
+        assert_equal( { :term => { "bar" => { :term => "baz" } } }, query[:boosting][:positive].last )
+      end
+
+      should "allow passing variables from outer scope" do
+        @q1 = 'foo'
+        @q2 = 'bar'
+        query = Query.new.boosting do |boosting|
+          boosting.positive { |query| query.string @q1 }
+          boosting.negative { |query| query.string @q2 }
+        end
+
+        assert_equal( { :query_string => {:query => 'foo'} }, query[:boosting][:positive].first )
+        assert_equal( { :query_string => {:query => 'bar'} }, query[:boosting][:negative].last )
+      end
+
+    end
+
+    context "MatchQuery" do
+
+      should "allow searching in single field" do
+        assert_equal( { :match => { :foo => { :query => 'bar' } } },
+                      Query.new.match(:foo, 'bar') )
+      end
+
+      should "allow searching in multiple fields with multi_match" do
+        assert_equal( { :multi_match => { :query => 'bar', :fields => [:foo, :moo] } },
+                      Query.new.match([:foo, :moo], 'bar') )
+      end
+
+      should "encode options" do
+        query = Query.new.match(:foo, 'bar', :type => 'phrase_prefix')
+        assert_equal 'phrase_prefix', query[:match][:foo][:type]
+      end
+
+      should "automatically construct a boolean query" do
+        query = Query.new
+        query.match(:foo, 'bar')
+        query.match(:moo, 'bar')
+
+        assert_not_nil  query.to_hash[:bool]
+        assert_equal 2, query.to_hash[:bool][:must].size
+      end
+
+    end
+
+    context "NestedQuery" do
+
+      should "not raise an error when no block is given" do
+        assert_nothing_raised { Query.new.nested }
+      end
+
+      should "encode options" do
+        query = Query.new.nested(:path => 'articles', :score_mode => 'score_mode') do
+          query { string 'foo' }
+        end
+
+        assert_equal 'articles',   query[:nested][:path]
+        assert_equal 'score_mode', query[:nested][:score_mode]
+      end
+
+      should "wrap single query" do
+        assert_equal( { :nested => {:query => { :query_string => { :query => 'foo' } } }},
+                      Query.new.nested { query { string 'foo' } } )
+      end
+
+    end
+
+    context 'ConstantScoreQuery' do
+      should "not raise an error when no block is given" do
+        assert_nothing_raised { Query.new.constant_score }
+      end
+
+      should "wrap query" do
+        assert_equal( { :constant_score => {:query => { :term => { :attr => { :term => 'foo' } } } } },
+                      Query.new.constant_score { query { term :attr, 'foo' } } )
+      end
+
+      should "wrap filter" do
+        assert_equal( { :constant_score => {:filter => { :term => { :attr => 'foo' } } } },
+                      Query.new.constant_score { filter :term, :attr => 'foo' } )
+      end
+
+      should "wrap the boost" do
+        assert_equal( { :constant_score => {:boost => 3 } },
+                      Query.new.constant_score { boost 3 } )
+      end
+
+    end
+
+  end
 end

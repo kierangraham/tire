@@ -19,7 +19,7 @@ module Tire
       context "Model::Search" do
 
         setup do
-          @stub = stub('search') { stubs(:query).returns(self); stubs(:perform).returns(self); stubs(:results).returns([]) }
+          @stub = stub('search') { stubs(:query).returns(self); stubs(:perform).returns(self); stubs(:results).returns([]); stubs(:size).returns(true) }
           Tire::Index.any_instance.stubs(:exists?).returns(false)
         end
 
@@ -39,7 +39,7 @@ module Tire
         should "limit searching in index for documents matching the model 'document_type'" do
           Tire::Search::Search.
             expects(:new).
-            with(ActiveModelArticle.index_name, { :type => ActiveModelArticle.document_type }).
+            with('active_model_articles', { :type => 'active_model_article' }).
             returns(@stub).
             twice
 
@@ -121,6 +121,16 @@ module Tire
           assert_equal 'Article', document.title
         end
 
+        should "not pass the search option as URL parameter" do
+          Configuration.client.
+            expects(:get).with do |url, payload|
+              assert ! url.include?('sort')
+            end.
+            returns( mock_response({ 'hits' => { 'hits' => [] } }.to_json) )
+
+          ActiveModelArticle.search(@q, :sort => 'title:DESC').results
+        end
+
         context "searching with a block" do
           setup do
             Tire::Search::Search.any_instance.expects(:perform).returns(@stub)
@@ -150,6 +160,14 @@ module Tire
 
             ActiveModelArticle.search :per_page => 10, :page => 3 do
               query { string 'foo' }
+            end
+          end
+
+          should "allow to pass :version option" do
+            Tire::Search::Search.any_instance.expects(:version).with(true)
+
+            ActiveModelArticle.search :version => true do
+              query { all }
             end
           end
 
@@ -183,14 +201,14 @@ module Tire
           should "allow to specify sort direction" do
             Tire::Search::Sort.any_instance.expects(:by).with('title', 'DESC')
 
-            ActiveModelArticle.search @q, :order => 'title DESC'
+            ActiveModelArticle.search @q, :order => 'title:DESC'
           end
 
           should "allow to specify more fields to sort on" do
             Tire::Search::Sort.any_instance.expects(:by).with('title', 'DESC')
             Tire::Search::Sort.any_instance.expects(:by).with('author.name', nil)
 
-            ActiveModelArticle.search @q, :order => ['title DESC', 'author.name']
+            ActiveModelArticle.search @q, :order => ['title:DESC', 'author.name']
           end
 
           should "allow to specify number of results per page" do
@@ -219,6 +237,31 @@ module Tire
 
             Tire::Search::Search.any_instance.expects(:fields).with(["id", "title"])
             ActiveModelArticle.search @q, :fields => ['id', 'title']
+          end
+
+          should "allow to pass :version option" do
+            Tire::Search::Search.any_instance.expects(:version).with(true)
+
+            ActiveModelArticle.search @q, :version => true
+          end
+
+        end
+
+        context "multi search" do
+
+          should "perform search request within corresponding index and type" do
+            Tire::Search::Multi::Search.
+              expects(:new).
+              with do |index, options, block|
+                assert_equal 'active_model_articles', index
+                assert_equal 'active_model_article',  options[:type]
+              end.
+              returns( mock(:results => []) )
+
+            ActiveModelArticle.multi_search do
+              search 'foo'
+              search 'xoo'
+            end
           end
 
         end
@@ -596,7 +639,7 @@ module Tire
 
           end
 
-          should "serialize mapped properties when mapping procs are set" do
+          should "evaluate :as mapping options passed as strings or procs" do
             class ::ModelWithMappingProcs
               extend  ActiveModel::Naming
               extend  ActiveModel::Callbacks
@@ -630,6 +673,28 @@ module Tire
             assert_equal 1, document['one']
             assert_equal 2, document['two']
             assert_equal 3, document['three']
+          end
+
+          should "index :as mapping options passed as arbitrary objects" do
+            class ::ModelWithMappingOptionAsObject
+              extend  ActiveModel::Naming
+              extend  ActiveModel::Callbacks
+              include ActiveModel::Serialization
+              include Tire::Model::Search
+
+              mapping do
+                indexes :one,   :as => [1, 2, 3]
+              end
+
+              attr_reader :attributes
+
+              def initialize(attributes = {}); @attributes = attributes; end
+            end
+
+            model    = ::ModelWithMappingOptionAsObject.new
+            document = MultiJson.decode(model.to_indexed_json)
+
+            assert_equal [1, 2, 3], document['one']
           end
 
         end
@@ -683,7 +748,7 @@ module Tire
               percolate!
             end
 
-            assert_equal true, ::ActiveModelArticleWithCallbacks.percolator
+            assert_equal true, ::ActiveModelArticleWithPercolation.percolator
           end
 
           should "set the percolator pattern" do
@@ -691,7 +756,7 @@ module Tire
               percolate! 'tags:alert'
             end
 
-            assert_equal 'tags:alert', ::ActiveModelArticleWithCallbacks.percolator
+            assert_equal 'tags:alert', ::ActiveModelArticleWithPercolation.percolator
           end
 
           should "mark the class for percolation on index update" do

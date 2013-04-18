@@ -15,7 +15,9 @@ module Tire
     context "Item" do
 
       setup do
-        @document = Results::Item.new :title => 'Test', :author => { :name => 'Kafka' }
+        @document = Results::Item.new :title  => 'Test',
+                                      :author => { :name => 'Kafka' },
+                                      :awards => { :best_fiction => { :year => '1925' } }
       end
 
       should "be initialized with a Hash or Hash like object" do
@@ -63,6 +65,11 @@ module Tire
         assert_equal 'Test', @document.title
       end
 
+      should "implement respond_to? for proxied methods" do
+        assert @document.respond_to?(:title)
+        assert @document.respond_to?(:title, true)
+      end
+
       should "return nil for non-existing keys/methods" do
         assert_nothing_raised { @document.whatever }
         assert_nil @document.whatever
@@ -106,10 +113,21 @@ module Tire
 
       should "be convertible to hash" do
         assert_instance_of Hash, @document.to_hash
+        assert_instance_of Hash, @document.to_hash[:author]
+        assert_instance_of Hash, @document.to_hash[:awards][:best_fiction]
+
+        assert_equal 'Kafka', @document.to_hash[:author][:name]
+        assert_equal '1925',  @document.to_hash[:awards][:best_fiction][:year]
+      end
+
+      should "be convertible to JSON" do
+        assert_instance_of Hash, @document.as_json
+        assert_equal 'Test', @document.as_json(:only => 'title')['title']
+        assert_nil           @document.as_json(:only => 'title')['author']
       end
 
       should "be inspectable" do
-        assert_match /<Item title|Item author/, @document.inspect
+        assert_match /<Item .* title|Item .* author/, @document.inspect
       end
 
       context "within Rails" do

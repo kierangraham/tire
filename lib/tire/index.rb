@@ -36,7 +36,7 @@ module Tire
       @response.success? ? @response : false
 
     ensure
-      curl = %Q|curl -X POST #{url} -d '#{MultiJson.encode(options)}'|
+      curl = %Q|curl -X POST #{url} -d '#{MultiJson.encode(options, :pretty => Configuration.pretty)}'|
       logged('CREATE', curl)
     end
 
@@ -52,9 +52,64 @@ module Tire
       alias_name ? Alias.all(@name).select { |a| a.name == alias_name }.first : Alias.all(@name)
     end
 
-    def mapping
+    # Get or update the index mapping
+    #
+    # Without arguments, returns the index mapping as a Hash
+    #
+    # When passed arguments, attempts to update the index mapping:
+    #
+    #     index.mapping 'article', properties: { body: { type: "string" } }
+    #
+    # You can pass the `ignore_conflicts` option as a part of the Hash:
+    #
+    #     index.mapping 'article', properties: { body: { type: "string" } }, ignore_conflicts: true
+    #
+    def mapping(*args)
+      args.empty? ? get_mapping : put_mapping(*args)
+    end
+
+    # Raises an exception for unsuccessful responses
+    #
+    def mapping!(*args)
+      mapping(*args)
+      raise RuntimeError, response.body unless response.success?
+    end
+
+    def get_mapping
       @response = Configuration.client.get("#{url}/_mapping")
-      MultiJson.decode(@response.body)[@name]
+      result = MultiJson.decode(@response.body)[@name]
+      @response.success? ? result : false
+    ensure
+      curl = %Q|curl -X GET "#{url}/_mapping?pretty"|
+      logged("GET MAPPING", curl)
+    end
+
+    def put_mapping(type, mapping)
+      params = {}
+      if ignore_conflicts = mapping.delete(:ignore_conflicts) || mapping.delete("ignore_conflicts")
+        params[:ignore_conflicts] = ignore_conflicts
+      end
+
+      url  = "#{self.url}/#{type}/_mapping"
+      url += "?#{params.to_param}" unless params.empty?
+
+      payload = { type => mapping }.to_json
+
+      @response = Configuration.client.put url, payload
+      result = MultiJson.decode(@response.body)
+      @response.success? ? result : false
+    ensure
+      curl = %Q|curl -X PUT "#{url}" -d '#{payload}'|
+      logged("PUT MAPPING #{type}", curl)
+    end
+
+    def delete_mapping(type)
+      url = "#{self.url}/#{type}"
+      @response = Configuration.client.delete(url)
+      @response.success?
+    ensure
+      curl = %Q|curl -X DELETE "#{url}"|
+      logged("DELETE MAPPING #{type}", curl)
     end
 
     def settings
@@ -64,37 +119,82 @@ module Tire
 
     def store(*args)
       document, options = args
-      type = get_type_from_document(document)
-
-      if options
-        percolate = options[:percolate]
-        percolate = "*" if percolate === true
-      end
 
       id       = get_id_from_document(document)
+      type     = get_type_from_document(document)
       document = convert_document_to_json(document)
 
-      url  = id ? "#{self.url}/#{type}/#{id}" : "#{self.url}/#{type}/"
-      url += "?percolate=#{percolate}" if percolate
+      options ||= {}
+      params    = {}
+
+      if options[:percolate]
+        params[:percolate] = options[:percolate]
+        params[:percolate] = "*" if params[:percolate] === true
+      end
+
+      params[:parent]  = options[:parent]  if options[:parent]
+      params[:routing] = options[:routing] if options[:routing]
+      params[:replication] = options[:replication] if options[:replication]
+
+      params_encoded = params.empty? ? '' : "?#{params.to_param}"
+
+      url  = id ? "#{self.url}/#{type}/#{Utils.escape(id)}#{params_encoded}" : "#{self.url}/#{type}/#{params_encoded}"
 
       @response = Configuration.client.post url, document
       MultiJson.decode(@response.body)
-
     ensure
       curl = %Q|curl -X POST "#{url}" -d '#{document}'|
       logged([type, id].join('/'), curl)
     end
 
-    def bulk_store(documents, options={})
+    # Performs a [bulk](http://www.elasticsearch.org/guide/reference/api/bulk.html) request
+    #
+    #     @myindex.bulk :index, [ {id: 1, title: 'One'}, { id: 2, title: 'Two', _version: 3 } ], refresh: true
+    #
+    # Pass the action (`index`, `create`, `delete`) as the first argument, the collection of documents as
+    # the second argument, and URL parameters as the last option.
+    #
+    # Any _meta_ information contained in documents (such as `_routing` or `_parent`) is extracted
+    # and added to the "header" line.
+    #
+    # Shortcut methods `bulk_store`, `bulk_delete` and `bulk_create` are available.
+    #
+    def bulk(action, documents, options={})
+      return false if documents.empty?
+
+      # TODO: A more Ruby-like DSL notation should be supported:
+      #
+      #     Tire.index('myindex').bulk do
+      #       create id: 1, title: 'bar', _routing: 'abc'
+      #       delete id: 1
+      #       # ...
+      #     end
+
       payload = documents.map do |document|
         type = get_type_from_document(document, :escape => false) # Do not URL-escape the _type
         id   = get_id_from_document(document)
 
-        STDERR.puts "[ERROR] Document #{document.inspect} does not have ID" unless id
+        if ENV['DEBUG']
+          STDERR.puts "[ERROR] Document #{document.inspect} does not have ID" unless id
+        end
+
+        header = { action.to_sym => { :_index => name, :_type => type, :_id => id } }
+
+        if document.respond_to?(:to_hash) && hash = document.to_hash
+          meta = {}
+          meta[:_version]   = hash.delete(:_version)
+          meta[:_routing]   = hash.delete(:_routing)
+          meta[:_percolate] = hash.delete(:_percolate)
+          meta[:_parent]    = hash.delete(:_parent)
+          meta[:_timestamp] = hash.delete(:_timestamp)
+          meta[:_ttl]       = hash.delete(:_ttl)
+          meta              = meta.reject { |name,value| !value || value.empty? }
+          header[action.to_sym].update(meta)
+        end
 
         output = []
-        output << %Q|{"index":{"_index":"#{@name}","_type":"#{type}","_id":"#{id}"}}|
-        output << convert_document_to_json(document)
+        output << MultiJson.encode(header)
+        output << convert_document_to_json(document) unless action.to_s == 'delete'
         output.join("\n")
       end
       payload << ""
@@ -103,7 +203,13 @@ module Tire
       count = 0
 
       begin
-        @response = Configuration.client.post("#{url}/_bulk", payload.join("\n"))
+        params = {}
+        params[:consistency] = options.delete(:consistency)
+        params[:refresh]     = options.delete(:refresh)
+        params               = params.reject { |name,value| !value }
+        params_encoded       = params.empty? ? '' : "?#{params.to_param}"
+
+        @response = Configuration.client.post("#{url}/_bulk#{params_encoded}", payload.join("\n"))
         raise RuntimeError, "#{@response.code} > #{@response.body}" if @response && @response.failure?
         @response
       rescue StandardError => error
@@ -117,21 +223,35 @@ module Tire
         end
 
       ensure
-        curl = %Q|curl -X POST "#{url}/_bulk" -d '{... data omitted ...}'|
-        logged('BULK', curl)
+        curl = %Q|curl -X POST "#{url}/_bulk" --data-binary '{... data omitted ...}'|
+        logged('_bulk', curl)
       end
+
+    end
+
+    def bulk_create(documents, options={})
+      bulk :create, documents, options
+    end
+
+    def bulk_store(documents, options={})
+      bulk :index, documents, options
+    end
+
+    def bulk_delete(documents, options={})
+      bulk :delete, documents, options
     end
 
     def import(klass_or_collection, options={})
       case
         when method = options.delete(:method)
           options = {:page => 1, :per_page => 1000}.merge options
-          while documents = klass_or_collection.send(method.to_sym, options.merge(:page => options[:page])) \
-                            and documents.to_a.length > 0
+          while (documents = klass_or_collection.send(method.to_sym, options.merge(:page => options[:page]))) \
+                            && documents.to_a.length > 0
 
             documents = yield documents if block_given?
 
             bulk_store documents, options
+            GC.start
             options[:page] += 1
           end
 
@@ -140,8 +260,8 @@ module Tire
           bulk_store documents, options
 
         else
-          raise ArgumentError, "Please pass either an Enumerable compatible class, or a collection object" +
-                               "with a method for fetching records in batches (such as 'paginate')"
+          raise ArgumentError, "Please pass either an Enumerable compatible class, or a collection object " +
+                               "with a method for fetching records in batches (such as 'paginate')."
       end
     end
 
@@ -149,10 +269,17 @@ module Tire
       new_index = Index.new(name)
       new_index.create(options) unless new_index.exists?
 
+      transform = options.delete(:transform)
+
       Search::Scan.new(self.name, &block).each do |results|
-        new_index.bulk_store results.map do |document|
-          document.to_hash.except(:type, :_index, :_explanation, :_score, :_version, :highlight, :sort)
+
+        documents = results.map do |document|
+          document  = document.to_hash.except(:type, :_index, :_explanation, :_score, :_version, :highlight, :sort)
+          document  = transform.call(document) if transform
+          document
         end
+
+        new_index.bulk_store documents
       end
     end
 
@@ -168,49 +295,56 @@ module Tire
       end
       raise ArgumentError, "Please pass a document ID" unless id
 
-      url    = "#{self.url}/#{type}/#{id}"
+      url    = "#{self.url}/#{type}/#{Utils.escape(id)}"
       result = Configuration.client.delete url
       MultiJson.decode(result.body) if result.success?
 
     ensure
       curl = %Q|curl -X DELETE "#{url}"|
-      logged(id, curl)
+      logged("#{type}/#{id}", curl)
     end
 
-    def retrieve(type, id)
+    def retrieve(type, id, options={})
       raise ArgumentError, "Please pass a document ID" unless id
 
-      type      = Utils.escape(type)
-      url       = "#{self.url}/#{type}/#{id}"
-      @response = Configuration.client.get url
+      url       = "#{self.url}/#{Utils.escape(type)}/#{Utils.escape(id)}"
+
+      params    = {}
+      params[:routing]    = options[:routing] if options[:routing]
+      params[:fields]     = options[:fields]  if options[:fields]
+      params[:preference] = options[:preference] if options[:preference]
+      params_encoded      = params.empty? ? '' : "?#{params.to_param}"
+
+      @response = Configuration.client.get "#{url}#{params_encoded}"
 
       h = MultiJson.decode(@response.body)
-      if Configuration.wrapper == Hash then h
+      wrapper = options[:wrapper] || Configuration.wrapper
+      if wrapper == Hash then h
       else
         return nil if h['exists'] == false
         document = h['_source'] || h['fields'] || {}
         document.update('id' => h['_id'], '_type' => h['_type'], '_index' => h['_index'], '_version' => h['_version'])
-        Configuration.wrapper.new(document)
+        wrapper.new(document)
       end
 
     ensure
       curl = %Q|curl -X GET "#{url}"|
-      logged(id, curl)
+      logged("#{type}/#{id}", curl)
     end
 
     def update(type, id, payload={}, options={})
       raise ArgumentError, "Please pass a document type" unless type
       raise ArgumentError, "Please pass a document ID"   unless id
-      raise ArgumentError, "Please pass a script in the payload hash" unless payload[:script]
+      raise ArgumentError, "Please pass a script or partial document in the payload hash" unless payload[:script] || payload[:doc]
 
       type      = Utils.escape(type)
-      url       = "#{self.url}/#{type}/#{id}/_update"
+      url       = "#{self.url}/#{type}/#{Utils.escape(id)}/_update"
       url      += "?#{options.to_param}" unless options.keys.empty?
       @response = Configuration.client.post url, MultiJson.encode(payload)
       MultiJson.decode(@response.body)
 
     ensure
-      curl = %Q|curl -X POST "#{url}" -d '#{MultiJson.encode(payload)}'|
+      curl = %Q|curl -X POST "#{url}" -d '#{MultiJson.encode(payload, :pretty => Configuration.pretty)}'|
       logged(id, curl)
     end
 
@@ -259,7 +393,7 @@ module Tire
       MultiJson.decode(@response.body)['ok']
 
     ensure
-      curl = %Q|curl -X PUT "#{Configuration.url}/_percolator/#{@name}/?pretty=1" -d '#{MultiJson.encode(options)}'|
+      curl = %Q|curl -X PUT "#{Configuration.url}/_percolator/#{@name}/#{name}?pretty" -d '#{MultiJson.encode(options, :pretty => Configuration.pretty)}'|
       logged('_percolator', curl)
     end
 
@@ -287,7 +421,7 @@ module Tire
       MultiJson.decode(@response.body)['matches']
 
     ensure
-      curl = %Q|curl -X GET "#{url}/#{type}/_percolate?pretty=1" -d '#{payload.to_json}'|
+      curl = %Q|curl -X GET "#{url}/#{type}/_percolate?pretty" -d '#{MultiJson.encode(payload, :pretty => Configuration.pretty)}'|
       logged('_percolate', curl)
     end
 
@@ -300,10 +434,11 @@ module Tire
         code = @response ? @response.code : error.class rescue 'N/A'
 
         if Configuration.logger.level.to_s == 'debug'
-          body = if @response
-            defined?(Yajl) ? Yajl::Encoder.encode(@response.body, :pretty => true) : MultiJson.encode(@response.body)
-          else
-            error.message rescue ''
+          body = if @response && @response.body && !@response.body.to_s.empty?
+              MultiJson.encode( MultiJson.load(@response.body), :pretty => Configuration.pretty)
+            elsif error && error.message && !error.message.to_s.empty?
+              MultiJson.encode( MultiJson.load(error.message), :pretty => Configuration.pretty) rescue ''
+            else ''
           end
         else
           body = ''
@@ -339,7 +474,7 @@ module Tire
         when document.is_a?(Hash)
           document[:_id] || document['_id'] || document[:id] || document['id']
         when document.respond_to?(:id) && document.id != document.object_id
-          document.id
+          document.id.as_json
       end
       $VERBOSE = old_verbose
       id
@@ -348,8 +483,10 @@ module Tire
     def convert_document_to_json(document)
       document = case
         when document.is_a?(String)
-          Tire.warn "Passing the document as JSON string in Index#store has been deprecated, " +
-                     "please pass an object which responds to `to_indexed_json` or a plain Hash."
+          if ENV['DEBUG']
+            Tire.warn "Passing the document as JSON string has been deprecated, " +
+                       "please pass an object which responds to `to_indexed_json` or a plain Hash."
+          end
           document
         when document.respond_to?(:to_indexed_json) then document.to_indexed_json
         else raise ArgumentError, "Please pass a JSON string or object with a 'to_indexed_json' method," +

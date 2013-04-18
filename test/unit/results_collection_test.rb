@@ -8,9 +8,10 @@ module Tire
       setup do
         begin; Object.send(:remove_const, :Rails); rescue; end
         Configuration.reset
-        @default_response = { 'hits' => { 'hits' => [{'_id' => 1, '_score' => 1, '_source' => {:title => 'Test'}},
+        @default_response = { 'hits' => { 'hits' => [{'_id' => 1, '_score' => 1, '_source' => {:title => 'Test', :author => 'John'}},
                                                      {'_id' => 2},
-                                                     {'_id' => 3}] } }
+                                                     {'_id' => 3}],
+                                          'max_score' => 1.0 } }
       end
 
       should "be iterable" do
@@ -32,11 +33,20 @@ module Tire
         assert_equal 2, Results::Collection.new(@default_response)[1][:id]
       end
 
-      should "be initialized with parsed json" do
+      should "allow slicing" do
+        assert_equal [2,3], Results::Collection.new(@default_response)[1,2].map  {|res| res[:id]}
+        assert_equal [3],   Results::Collection.new(@default_response)[-1,1].map {|res| res[:id]}
+      end
+
+      should "be initialized with parsed JSON" do
         assert_nothing_raised do
           collection = Results::Collection.new( @default_response )
           assert_equal 3, collection.results.count
         end
+      end
+
+      should "return success/failure state" do
+        assert Results::Collection.new( @default_response ).success?
       end
 
       should "be populated lazily" do
@@ -59,8 +69,48 @@ module Tire
 
       should "be kaminari compatible" do
         collection = Results::Collection.new(@default_response)
-        %w(limit_value total_count num_pages offset_value).each do |method|
+        %w(limit_value total_count num_pages offset_value first_page? last_page?).each do |method|
           assert_respond_to collection, method
+        end
+      end
+
+      should "have max_score" do
+        collection = Results::Collection.new(@default_response)
+        assert_equal 1.0, collection.max_score
+      end
+
+      context "serialization" do
+
+        should "be serialized to JSON" do
+          collection = Results::Collection.new(@default_response)
+          assert_instance_of Array, collection.as_json
+          assert_equal 'Test', collection.as_json.first['title']
+          assert_equal 'John', collection.as_json.first['author']
+        end
+
+        should "pass options to as_json" do
+          collection = Results::Collection.new(@default_response)
+          assert_equal 'Test', collection.as_json(:only => 'title').first['title']
+          assert_nil           collection.as_json(:only => 'title').first['author']
+        end
+
+      end
+
+      context "with error response" do
+        setup do
+          @collection = Results::Collection.new({'error' => 'SearchPhaseExecutionException...'})
+        end
+
+        should "return the error" do
+          assert_equal 'SearchPhaseExecutionException...', @collection.error
+        end
+
+        should "return the success/failure state" do
+          assert @collection.failure?
+        end
+
+        should "return empty results" do
+          assert @collection.empty?
         end
       end
 
@@ -165,6 +215,40 @@ module Tire
 
       end
 
+      context "returning results with hits" do
+        should "yield the Item result and the raw hit" do
+          response = { 'hits' => { 'hits' => [ { '_id' => 1, '_score' => 0.5, '_index' => 'testing', '_type' => 'article', '_source' => { :title => 'Test', :body => 'Lorem' } } ] } }
+
+          Results::Collection.new(response).each_with_hit do |result, hit|
+            assert_instance_of Tire::Results::Item, result
+            assert_instance_of Hash, hit
+            assert_equal 'Test',   result.title
+            assert_equal 0.5, hit['_score']
+          end
+        end
+
+        should "yield the model instance and the raw hit" do
+          response = { 'hits' => { 'hits' => [ {'_id' => 1, '_score' => 0.5, '_type' => 'active_record_article'} ] } }
+
+          ActiveRecord::Base.establish_connection( :adapter => 'sqlite3', :database => ":memory:" )
+          ActiveRecord::Migration.verbose = false
+          ActiveRecord::Schema.define(:version => 1) { create_table(:active_record_articles) { |t| t.string(:title) } }
+          model = ActiveRecordArticle.new(:title => 'Test'); model.id = 1
+
+          ActiveRecordArticle.expects(:find).with([1]).returns([ model] )
+
+          Results::Collection.new(response, :load => true).each_with_hit do |result, hit|
+            assert_instance_of ActiveRecordArticle, result
+            assert_instance_of Hash, hit
+            assert_equal 'Test',   result.title
+            assert_equal 0.5, hit['_score']
+          end
+
+        end
+
+
+      end
+
       context "while paginating results" do
 
         setup do
@@ -210,6 +294,13 @@ module Tire
 
         should "return next page" do
           assert_equal 3, @collection.next_page
+        end
+
+        should "have default per_page" do
+          assert_equal 10, Tire::Results::Pagination::default_per_page
+
+          collection = Results::Collection.new @default_response
+          assert_equal 10, collection.per_page
         end
 
       end
